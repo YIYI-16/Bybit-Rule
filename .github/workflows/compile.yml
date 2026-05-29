@@ -1,10 +1,9 @@
 name: Compile Rulesets
 
 on:
-  push:
-    paths:
-      - 'bybit.list'
-  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 时间 02:00 (北京时间 10:00) 自动运行一次
+  workflow_dispatch:     # 允许你在 Actions 页面手动点击运行
 
 jobs:
   build-and-deploy:
@@ -23,7 +22,7 @@ jobs:
 
       - name: Download & Install Compilers
         run: |
-          # 获取并安装 sing-box (使用大写 -O 参数重命名输出文件，避免与 -o 日志参数混淆)
+          # 获取并安装 sing-box
           SINGBOX_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
           wget -q -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
           tar -xzf sing-box.tar.gz
@@ -36,9 +35,12 @@ jobs:
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/
 
-      - name: Convert Format and Compile
+      - name: Fetch Upstream List and Compile
         run: |
-          # 提取 list 并生成中间件 JSON 和 YAML
+          # 1. 从上游仓库下载最新的 bybit.list
+          wget -q -O bybit.list "https://raw.githubusercontent.com/Mattease/Bybit-SRS-RULES/main/bybit.list"
+          
+          # 2. 编写 Python 转换脚本
           cat << 'EOF' > convert.py
           import json
           
@@ -57,11 +59,11 @@ jobs:
                           mh.append(f"'{value}'")
                       elif rule_type == "DOMAIN-SUFFIX":
                           sb["domain_suffix"].append(value)
-                          mh.append(f"'+.{value}'") # Mihomo 使用通配语法
+                          mh.append(f"'+.{value}'")
                       elif rule_type == "DOMAIN-KEYWORD":
                           sb["domain_keyword"].append(value)
           
-          # 写入 sing-box json (v2 格式内存占用更优)
+          # 写入 sing-box json
           sb_item = {k: v for k, v in sb.items() if v}
           with open("singbox.json", "w", encoding="utf-8") as f:
               json.dump({"version": 2, "rules": [sb_item] if sb_item else []}, f, indent=2)
@@ -71,9 +73,10 @@ jobs:
               f.write("payload:\n" + "".join(f"  - {x}\n" for x in mh))
           EOF
           
+          # 3. 执行转换脚本
           python convert.py
           
-          # 编译成最终的二进制格式
+          # 4. 编译成最终的二进制格式
           sing-box rule-set compile --output bybit.srs singbox.json
           mihomo convert-ruleset domain yaml mihomo.yaml bybit.mrs
 
@@ -85,7 +88,7 @@ jobs:
           
           # 如果有变更则提交并推送
           if ! git diff --staged --quiet; then
-            git commit -m "chore: auto-compile bybit rules to .srs and .mrs"
+            git commit -m "chore: auto-update rules from upstream"
             git push
           else
             echo "No changes detected, skipping commit."
