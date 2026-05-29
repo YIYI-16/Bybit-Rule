@@ -1,0 +1,92 @@
+name: Compile Rulesets
+
+on:
+  push:
+    paths:
+      - 'bybit.list'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Download & Install Compilers
+        run: |
+          # 获取并安装 sing-box (使用大写 -O 参数重命名输出文件，避免与 -o 日志参数混淆)
+          SINGBOX_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          wget -q -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz
+          sudo mv sing-box-*/sing-box /usr/local/bin/
+
+          # 获取并安装 mihomo
+          MIHOMO_VER=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          wget -q -O mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-v${MIHOMO_VER}.gz"
+          gunzip mihomo.gz
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/
+
+      - name: Convert Format and Compile
+        run: |
+          # 提取 list 并生成中间件 JSON 和 YAML
+          cat << 'EOF' > convert.py
+          import json
+          
+          sb = {"domain": [], "domain_suffix": [], "domain_keyword": []}
+          mh = []
+          
+          with open("bybit.list", "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"): continue
+                  parts = line.split(",")
+                  if len(parts) >= 2:
+                      rule_type, value = parts[0], parts[1]
+                      if rule_type == "DOMAIN":
+                          sb["domain"].append(value)
+                          mh.append(f"'{value}'")
+                      elif rule_type == "DOMAIN-SUFFIX":
+                          sb["domain_suffix"].append(value)
+                          mh.append(f"'+.{value}'") # Mihomo 使用通配语法
+                      elif rule_type == "DOMAIN-KEYWORD":
+                          sb["domain_keyword"].append(value)
+          
+          # 写入 sing-box json (v2 格式内存占用更优)
+          sb_item = {k: v for k, v in sb.items() if v}
+          with open("singbox.json", "w", encoding="utf-8") as f:
+              json.dump({"version": 2, "rules": [sb_item] if sb_item else []}, f, indent=2)
+          
+          # 写入 mihomo yaml payload
+          with open("mihomo.yaml", "w", encoding="utf-8") as f:
+              f.write("payload:\n" + "".join(f"  - {x}\n" for x in mh))
+          EOF
+          
+          python convert.py
+          
+          # 编译成最终的二进制格式
+          sing-box rule-set compile --output bybit.srs singbox.json
+          mihomo convert-ruleset domain yaml mihomo.yaml bybit.mrs
+
+      - name: Commit and Push Assets
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add bybit.srs bybit.mrs
+          
+          # 如果有变更则提交并推送
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: auto-compile bybit rules to .srs and .mrs"
+            git push
+          else
+            echo "No changes detected, skipping commit."
+          fi
